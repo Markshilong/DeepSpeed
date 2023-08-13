@@ -592,6 +592,91 @@ class PipelineModule(nn.Module):
             final_state_dict = clone_tensors_for_torch_save(orig_state_dict)
             checkpoint_engine.save(final_state_dict, model_ckpt_path)
 
+    # lsl_zero
+    def load_state_dir_nvmeOffload(self, load_dir, checkpoint_engine, strict=True):
+
+        def _load_state_dict_into_model(model_to_load, state_dict, start_prefix=""):
+            # Convert old format to new format if needed from a PyTorch state_dict
+            old_keys = []
+            new_keys = []
+            for key in state_dict.keys():
+                new_key = None
+                if "gamma" in key:
+                    new_key = key.replace("gamma", "weight")
+                if "beta" in key:
+                    new_key = key.replace("beta", "bias")
+                if new_key:
+                    old_keys.append(key)
+                    new_keys.append(new_key)
+            for old_key, new_key in zip(old_keys, new_keys):
+                state_dict[new_key] = state_dict.pop(old_key)
+
+            # copy state_dict so _load_from_state_dict can modify it
+            metadata = getattr(state_dict, "_metadata", None)
+            state_dict = state_dict.copy()
+            if metadata is not None:
+                state_dict._metadata = metadata
+
+            error_msgs = []
+
+            # PyTorch's `_load_from_state_dict` does not copy parameters in a module's descendants
+            # so we need to apply the function recursively.
+            def load(module: nn.Module, state_dict, prefix=""):
+                local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
+                args = (state_dict, prefix, local_metadata, True, [], [], error_msgs)
+                # Parameters of module and children will start with prefix. We can exit early if there are none in this
+                # state_dict
+                if len([key for key in state_dict if key.startswith(prefix)]) > 0:
+                    import deepspeed
+
+                    # In sharded models, each shard has only part of the full state_dict, so only gather
+                    # parameters that are in the current state_dict.
+                    named_parameters = dict(module.named_parameters(prefix=prefix[:-1], recurse=False))
+                    params_to_gather = [named_parameters[k] for k in state_dict.keys() if k in named_parameters]
+                    if len(params_to_gather) > 0:
+                        # because zero3 puts placeholders in model params, this context
+                        # manager gathers (unpartitions) the params of the current layer, then loads from
+                        # the state dict and then re-partitions them again
+                        with deepspeed.zero.GatheredParameters(params_to_gather, modifier_rank=0):
+                            if torch.distributed.get_rank() == 0:
+                                module._load_from_state_dict(*args)
+
+                for name, child in module._modules.items():
+                    if child is not None:
+                        load(child, state_dict, prefix + name + ".")
+
+            load(model_to_load, state_dict, prefix=start_prefix)
+            # Delete `state_dict` so it could be collected by GC earlier. Note that `state_dict` is a copy of the argument, so
+            # it's safe to delete it.
+            del state_dict
+
+            return error_msgs
+        
+        for idx, layer in enumerate(self.forward_funcs):
+            # Functions, etc. will not have state_dicts
+            if not hasattr(layer, 'load_state_dict'):
+                continue
+
+            # get all checkpoint files for the layer.
+            model_ckpt_list = self.ckpt_layer_path_list(load_dir, idx)
+            mp_rank = self._grid.get_slice_parallel_rank()
+            mp_world_size = self._grid.get_slice_parallel_world_size()
+
+            sd_loader = SDLoaderFactory.get_sd_loader(model_ckpt_list,
+                                                      version=2.0,
+                                                      checkpoint_engine=checkpoint_engine)
+            load_path, checkpoint, _ = sd_loader.load(mp_world_size, mp_rank, module_key=None, is_pipe_parallel=True)
+
+            # layer.load_state_dict(checkpoint, strict=strict)
+            _load_state_dict_into_model(layer, checkpoint)
+
+            # if self._grid.data_parallel_id == 0:
+            #     logger.info(
+            #         f'RANK={self.global_rank} Loaded layer={idx+self._local_start} file={load_path}'
+            #     )
+
+        self._synchronize_tied_weights()
+    
     def load_state_dir(self, load_dir, checkpoint_engine, strict=True):
         for idx, layer in enumerate(self.forward_funcs):
             # Functions, etc. will not have state_dicts
